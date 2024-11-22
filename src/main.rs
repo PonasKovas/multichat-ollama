@@ -176,7 +176,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     model: config.ollama.model.clone(),
                     messages,
                     stream: false,
-                    keep_alive: "5m".to_string(), // keep the model loaded for 5 minutes after this request
+                    keep_alive: "1m".to_string(), // keep the model loaded for 5 minutes after this request
                     options: OllamaOptions {
                         temperature: config.ollama.temperature,
                     },
@@ -203,8 +203,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let msg = json["message"]["content"].as_str().unwrap();
 
                         // reply with the message contents
-                        info!("sending reply: {msg:?}");
-                        client.send_message(update.gid, my_uid, msg, &[]).await?;
+                        info!(
+                            "sending reply (msg history: {}): {msg:?}",
+                            message_history.len()
+                        );
+                        info!("history: {message_history:?}");
+                        client
+                            .send_message(
+                                update.gid,
+                                my_uid,
+                                msg.strip_prefix("ollama: ").unwrap_or(msg),
+                                &[],
+                            )
+                            .await?;
                     }
                     Err(e) => eprintln!("Request error: {:?}", e),
                 }

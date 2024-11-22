@@ -9,6 +9,10 @@ groups = ["foo"]
 base-url = "https://example.com"
 mention-name = "ollama"
 model = "llama2-uncensored:7b"
-system-prompt = "You are an AI assistant in an internet groupchat. The following are messages from the groupchat. Your name is {mention_name}. You have been mentioned in the last message. Write a response to the it. Do not say hi every single time, you are already part of the conversation. Write your whole response in a single message, do not split it."
+system-prompt = """You are an AI assistant in an internet groupchat. Your name is {mention_name}. You have been mentioned in the last message. Write a response to it.
+
+Do not say hi every single time, you are already part of the conversation.
+
+Write your whole response in a single message, do not split it."""
 prompt-messages-n = 100
 temperature = 0.5

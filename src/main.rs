@@ -207,7 +207,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             "sending reply (msg history: {}): {msg:?}",
                             message_history.len()
                         );
-                        info!("history: {message_history:?}");
                         client
                             .send_message(
                                 update.gid,

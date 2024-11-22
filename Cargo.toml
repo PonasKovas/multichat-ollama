@@ -1,0 +1,37 @@
+[package]
+name = "multichat-ollama"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Multichat Ollama client"
+
+[package.metadata.deb]
+maintainer-scripts = "systemd/"
+systemd-units = { enable = true }
+assets = [
+    { source = "example/config.toml", dest = "usr/share/multichat/ollama.toml", mode = "644" },
+    { source = "example/config.toml", dest = "etc/multichat/ollama.toml", mode = "644" },
+    { source = "target/release/multichat-ollama", dest = "usr/bin/multichat-ollama", mode = "755" },
+]
+
+[dependencies]
+multichat-client = { git = "https://github.com/htrefil/multichat.git" }
+
+clap = { version = "4.5.20", features = ["derive"] }
+serde = { version = "1.0.214", features = ["derive"] }
+tokio = { version = "1.41.1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "fs",
+] }
+toml = "0.8.19"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+thiserror = "2.0.3"
+rustls = "0.23.16"
+rustls-pemfile = "2.2.0"
+tokio-rustls = "0.26.0"
+url = { version = "2.5.3", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1.0"

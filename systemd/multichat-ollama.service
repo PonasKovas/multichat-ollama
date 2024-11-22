@@ -1,0 +1,11 @@
+[Unit]
+Description=Multichat Ollama client
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/multichat-ollama /etc/multichat/ollama.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

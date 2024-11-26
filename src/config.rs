@@ -24,12 +24,16 @@ pub struct Multichat {
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Ollama {
+    pub memory_file: PathBuf,
+    pub basic_auth_user: String,
+    pub basic_auth_password: String,
     pub base_url: Url,
     pub mention_name: String,
     pub model: String,
     pub system_prompt: String,
     pub prompt_messages_n: usize,
     pub temperature: f32,
+    pub top_k: u32,
 }
 
 #[cfg(test)]

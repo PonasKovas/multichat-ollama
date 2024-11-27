@@ -1,4 +1,6 @@
 use crate::{room_state::Message, State};
+use std::time::Duration;
+use tokio::time::sleep;
 use tracing::error;
 
 pub async fn handle_ollama_gen(
@@ -37,6 +39,8 @@ pub async fn handle_ollama_gen(
         if cleaned_msg.is_empty() {
             continue;
         }
+
+        sleep(Duration::from_millis(500)).await;
 
         state
             .mc_client

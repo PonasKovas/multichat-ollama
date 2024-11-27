@@ -1,24 +1,32 @@
 mod config;
+mod handle_mc_update;
+mod handle_ollama_gen;
+mod ollama_api;
+mod room_state;
 mod tls;
 
-use chrono::{DateTime, Utc};
-use chrono_humanize::{Accuracy, HumanTime, Tense};
+use anyhow::Context;
 use clap::Parser;
 use config::Config;
+use futures::future::FutureExt;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use handle_mc_update::handle_mc_update;
+use handle_ollama_gen::handle_ollama_gen;
 use multichat_client::proto::Config as ProtoConfig;
-use multichat_client::{ClientBuilder, UpdateKind};
-use serde::Serialize;
-use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
-use std::error::Error;
+use multichat_client::{ClientBuilder, EitherStream, Update};
+use room_state::{Message, RoomState};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
-use tokio::fs;
+use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio::{fs, select};
+use tokio_rustls::client::TlsStream;
 use tracing::{error, info, subscriber};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
-use tracing_subscriber::fmt;
-use tracing_subscriber::prelude::*;
+use tracing_subscriber::{fmt, prelude::*};
 
 #[derive(Parser)]
 struct Args {
@@ -26,423 +34,181 @@ struct Args {
     config: PathBuf,
 }
 
-#[derive(Serialize)]
-struct OllamaRequest {
-    model: String,
-    messages: Vec<MessageObject>,
-    stream: bool,
-    keep_alive: String,
-    options: OllamaOptions,
-}
-#[derive(Serialize)]
-struct MessageObject {
-    role: String,
-    content: String,
-}
-#[derive(Serialize)]
-struct OllamaOptions {
-    temperature: f32,
-    top_k: u32,
-}
-
-#[derive(Debug)]
-struct MessageMemory {
-    was_llm: bool,
-    time: DateTime<Utc>,
-    message: String,
-}
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            error!("{}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
-
     let registry = tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer().without_time().with_target(false));
-
     subscriber::set_global_default(registry).unwrap();
 
     let args = Args::parse();
 
     info!("Reading config from {}", args.config.display());
 
-    let config = match fs::read_to_string(&args.config).await {
-        Ok(config) => config,
-        Err(err) => {
-            return Err(format!("Error reading config: {}", err).into());
-        }
-    };
+    let config = fs::read_to_string(&args.config)
+        .await
+        .context("reading config")?;
+    let config = toml::from_str::<Config>(&config).context("parsing config")?;
 
-    let config = match toml::from_str::<Config>(&config) {
-        Ok(config) => config,
-        Err(err) => {
-            return Err(format!("Error parsing config: {}", err).into());
-        }
-    };
-
-    // group name -> memories
-    let mut all_memories: HashMap<String, Vec<String>> =
-        serde_json::from_str(&fs::read_to_string(&config.ollama.memory_file).await?)?;
-
-    let connector = match config.multichat.certificate {
-        Some(certificate) => match tls::configure(&certificate).await {
-            Ok(connector) => Some(connector),
-            Err(err) => {
-                return Err(format!("Error configuring TLS: {}", err).into());
-            }
-        },
-        None => None,
-    };
-
-    let mut proto_config = ProtoConfig::default();
-    proto_config.max_size(512 * 1024 * 1024); // 512 MiB
-
-    let (groups, mut client) = match timeout(
-        Duration::from_secs(5),
-        ClientBuilder::maybe_tls(connector)
-            .config(proto_config)
-            .connect(&config.multichat.server, config.multichat.access_token),
-    )
-    .await?
-    {
-        Ok((groups, client)) => (groups, client),
-        Err(err) => {
-            return Err(format!("Error connecting to multichat: {}", err).into());
-        }
-    };
+    let mut state = State::create(config).await.context("initialization")?;
 
     info!("Connected to Multichat");
 
-    let reqw_client = reqwest::Client::new();
-
-    let mut message_histories: HashMap<u32, VecDeque<MessageMemory>> = HashMap::new();
-    let mut usernames: HashMap<(u32, u32), String> = HashMap::new();
-    let mut my_uid: Vec<(u32, u32)> = Vec::new();
-
-    for group in &config.multichat.groups {
-        let gid = *groups.get(group.as_str()).ok_or("Group not found")?;
-        client.join_group(gid).await?;
-
-        let uid = client.join_user(gid, &config.multichat.user_name).await?;
-        my_uid.push((gid, uid));
-        usernames.insert((gid, uid), config.multichat.user_name.clone());
-        message_histories.insert(gid, VecDeque::new());
-    }
-
     loop {
-        let update = client.read_update().await?;
+        // we either wait for an update from multichat or
+        // the Ollama endpoint to finish generating a response in any of the groups
+        enum EventType {
+            FinishGenerate {
+                gid: u32,
+                res: anyhow::Result<String>,
+            },
+            Multichat {
+                update: Update,
+            },
+        }
 
-        match update.kind {
-            UpdateKind::Join(username) | UpdateKind::Rename(username) => {
-                usernames.insert((update.gid, update.uid), username.clone());
+        let event = {
+            let mut ollama_api_tasks: FuturesUnordered<_> = state
+                .rooms
+                .iter_mut()
+                .filter_map(|(gid, room)| {
+                    room.ollama_api_task
+                        .as_mut()
+                        .map(|join| join.map(|r| (*gid, r)))
+                })
+                .collect();
+
+            select! {
+                Some((gid, res)) = ollama_api_tasks.next(), if !ollama_api_tasks.is_empty() => {
+                    let res = res.unwrap(); // we unwrap the JoinError, since it would only be err if it panicked
+                    EventType::FinishGenerate { gid, res }
+                }
+                update = state.mc_client.read_update() => {
+                    EventType::Multichat { update: update.context("multichat update")? }
+                }
             }
-            UpdateKind::Leave => {
-                usernames.remove(&(update.gid, update.uid));
+        };
+
+        match event {
+            EventType::Multichat { update } => {
+                handle_mc_update(&mut state, update).await?;
             }
-            UpdateKind::Message(message) => {
-                let memories = all_memories
-                    .entry(
-                        groups
-                            .iter()
-                            .find(|(_, id)| **id == update.gid)
-                            .unwrap()
-                            .0
-                            .clone()
-                            .into_owned(),
-                    )
-                    .or_insert_with(Vec::new);
-
-                // add the message to the chat history
-                let message_history = message_histories
-                    .get_mut(&update.gid)
-                    .expect("received message from unknown group");
-                if message_history.len() == config.ollama.prompt_messages_n {
-                    message_history.pop_front();
-                }
-
-                let was_llm = my_uid.contains(&(update.gid, update.uid));
-
-                let memory = MessageMemory {
-                    was_llm,
-                    time: Utc::now(),
-                    message: format!(
-                        "{name}: {msg}",
-                        name = usernames.get(&(update.gid, update.uid)).unwrap(),
-                        msg = message.message,
-                    ),
-                };
-
-                info!(
-                    "(msg history: {}): {:?}",
-                    message_history.len(),
-                    memory.message
-                );
-
-                message_history.push_back(memory);
-
-                // the following code only applies for messages from other users
-                if was_llm {
-                    continue;
-                }
-
-                let my_uid = my_uid
-                    .iter()
-                    .find(|(gid, _uid)| *gid == update.gid)
-                    .expect("message from group where bot is not present")
-                    .1;
-
-                // handle some commands
-                if message.message.trim().starts_with("/memories")
-                    || message.message.trim().starts_with("/mems")
-                {
-                    client
-                        .send_message(
-                            update.gid,
-                            my_uid,
-                            &memories
-                                .iter()
-                                .enumerate()
-                                .map(|(i, m)| format!("{i} - {m}\n"))
-                                .collect::<String>(),
-                            &[],
-                        )
-                        .await?;
-                    continue;
-                }
-                if message.message.trim().starts_with("/rmem")
-                    || message.message.trim().starts_with("/rmemory")
-                {
-                    if let Some(idx) = message.message.trim().split_whitespace().nth(1) {
-                        match idx.parse::<usize>() {
-                            Err(e) => {
-                                client
-                                    .send_message(update.gid, my_uid, &format!("{e:?}"), &[])
-                                    .await?
-                            }
-                            Ok(idx) => {
-                                if idx >= memories.len() {
-                                    client
-                                        .send_message(
-                                            update.gid,
-                                            my_uid,
-                                            "invalid id, use /mems to list",
-                                            &[],
-                                        )
-                                        .await?
-                                } else {
-                                    let memory = memories.remove(idx);
-                                    client
-                                        .send_message(
-                                            update.gid,
-                                            my_uid,
-                                            &format!("removed {memory:?}"),
-                                            &[],
-                                        )
-                                        .await?;
-                                    // save
-                                    fs::write(
-                                        &config.ollama.memory_file,
-                                        &serde_json::to_string_pretty(&all_memories)?,
-                                    )
-                                    .await?;
-                                }
-                            }
-                        }
-                    } else {
-                        client
-                            .send_message(
-                                update.gid,
-                                my_uid,
-                                "/rmem <index> - remove a memory (/mems to list)",
-                                &[],
-                            )
-                            .await?;
-                    }
-                    continue;
-                }
-
-                // check if this new message mentions the bot
-                if !is_substring_isolated(&message.message, &config.ollama.mention_name) {
-                    continue;
-                }
-
-                let system_prompt = config
-                    .ollama
-                    .system_prompt
-                    .replace("{mention_name}", &config.ollama.mention_name)
-                    .replace(
-                        "{memories}",
-                        &memories
-                            .iter()
-                            .map(|m| format!("- {m}\n"))
-                            .collect::<String>(),
-                    );
-                let mut messages: Vec<_> = vec![
-                    MessageObject {
-                        role: "system".to_string(),
-                        content: system_prompt,
-                    },
-                    MessageObject {
-                        role: "assistant".to_string(),
-                        content: format!("Hello everyone! I'm back! Ready to fulfill your questionable requests and be obedient! :)"),
-                    },
-                ];
-
-                messages.extend(message_history.iter().map(|msg| {
-                    info!("{:?}", format_memory(&msg));
-                    MessageObject {
-                        role: if msg.was_llm { "assistant" } else { "user" }.to_string(),
-                        content: format_memory(&msg),
-                    }
-                }));
-                let body = OllamaRequest {
-                    model: config.ollama.model.clone(),
-                    messages,
-                    stream: false,
-                    keep_alive: "30s".to_string(), // how long to keep the model loaded for
-                    options: OllamaOptions {
-                        temperature: config.ollama.temperature,
-                        top_k: config.ollama.top_k,
-                    },
-                };
-
-                let mut url = config.ollama.base_url.clone();
-                url.set_path("api/chat");
-                let response = reqw_client
-                    .post(url)
-                    .basic_auth(
-                        &config.ollama.basic_auth_user,
-                        Some(&config.ollama.basic_auth_password),
-                    )
-                    .json(&body)
-                    .send()
-                    .await;
-
-                match response {
-                    Ok(res) => {
-                        if !res.status().is_success() {
-                            error!("Failed request. Status: {}. {res:?}", res.status());
-                            client
-                                .send_message(
-                                    update.gid,
-                                    my_uid,
-                                    &format!("Failed ollama request. Status: {}", res.status()),
-                                    &[],
-                                )
-                                .await?;
-                            continue;
-                        }
-
-                        // get the generated message
-                        let json = res.json::<Value>().await?;
-                        let msg = json["message"]["content"].as_str().unwrap();
-
-                        // check if new memory created
-                        if let Some(memory) = extract_between_tags(msg, "<MEMORY>", "</MEMORY>") {
-                            memories.push(memory.to_owned());
-                            // save
-                            fs::write(
-                                &config.ollama.memory_file,
-                                &serde_json::to_string_pretty(&all_memories)?,
-                            )
-                            .await?;
-                        }
-
-                        // reply with the message contents
-                        for msg in msg.split("\n\n") {
-                            let cleaned_msg = remove_quotes(
-                                remove_prefix_case_insensitive(
-                                    remove_quotes(msg.trim()).trim(),
-                                    "ollama: ",
-                                )
-                                .trim(),
-                            )
-                            .trim();
-
-                            if cleaned_msg.is_empty() {
-                                continue;
-                            }
-
-                            client
-                                .send_message(update.gid, my_uid, cleaned_msg, &[])
-                                .await?;
-                        }
-                    }
-                    Err(e) => eprintln!("Request error: {:?}", e),
-                }
+            EventType::FinishGenerate { gid, res } => {
+                handle_ollama_gen(&mut state, gid, res).await?;
             }
         }
     }
 }
 
-fn is_substring_isolated(s: &str, substr: &str) -> bool {
-    if let Some(index) = s.to_lowercase().find(substr.to_lowercase().as_str()) {
-        // Check the character before the substring
-        let before_is_valid = if index == 0 {
-            true // Nothing before, valid
-        } else {
-            // Find the character just before the substring
-            !s[..index].chars().rev().next().unwrap().is_alphabetic()
-        };
+struct State {
+    mc_client: multichat_client::Client<EitherStream<TlsStream<TcpStream>>>,
+    reqw: reqwest::Client,
+    config: Config,
 
-        // Check the character after the substring
-        let after_is_valid = if index + substr.len() == s.len() {
-            true // Nothing after, valid
-        } else {
-            // Find the character just after the substring
-            !s[(index + substr.len())..]
-                .chars()
-                .next()
-                .unwrap()
-                .is_alphabetic()
-        };
-
-        before_is_valid && after_is_valid
-    } else {
-        false
-    }
+    // group id -> room data
+    rooms: HashMap<u32, RoomState>,
 }
 
-fn remove_prefix_case_insensitive<'a>(s: &'a str, prefix: &'a str) -> &'a str {
-    if s.to_lowercase().starts_with(&prefix.to_lowercase()) {
-        &s[prefix.len()..]
-    } else {
-        s
-    }
-}
-
-fn remove_quotes(s: &str) -> &str {
-    if let Some(stripped) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        stripped
-    } else {
-        s
-    }
-}
-
-fn format_memory(memory: &MessageMemory) -> String {
-    if memory.was_llm {
-        format!("{}", memory.message)
-    } else {
-        format!(
-            "{} {}",
-            HumanTime::from(memory.time).to_text_en(Accuracy::Rough, Tense::Past),
-            memory.message
+impl State {
+    pub async fn create(config: Config) -> anyhow::Result<Self> {
+        let mut memories: HashMap<String, Vec<String>> = serde_json::from_str(
+            &fs::read_to_string(&config.ollama.memory_file)
+                .await
+                .context("reading memory file")?,
         )
-    }
-}
+        .context("parsing memory file")?;
 
-fn extract_between_tags<'a>(
-    text: &'a str,
-    start_tag: &'a str,
-    end_tag: &'a str,
-) -> Option<&'a str> {
-    if let Some(start_idx) = text.find(start_tag) {
-        let start = start_idx + start_tag.len();
-        if let Some(end_idx) = text[start..].find(end_tag) {
-            return Some(&text[start..start + end_idx]);
+        let mc_connector = match &config.multichat.certificate {
+            Some(certificate) => Some(tls::configure(certificate).await.context("TLS init")?),
+            None => None,
+        };
+
+        let mut proto_config = ProtoConfig::default();
+        proto_config.max_size(512 * 1024 * 1024); // 512 MiB
+
+        let (groups, mut mc_client) = timeout(
+            Duration::from_secs(5),
+            ClientBuilder::maybe_tls(mc_connector)
+                .config(proto_config)
+                .connect(&config.multichat.server, config.multichat.access_token),
+        )
+        .await
+        .context("connection timed out")?
+        .context("connection to multichat")?;
+
+        let mut rooms = HashMap::new();
+        for group_name in &config.multichat.groups {
+            let gid = *groups.get(group_name.as_str()).context("Group not found")?;
+            mc_client.join_group(gid).await?;
+
+            let my_uid = mc_client
+                .join_user(gid, &config.multichat.user_name)
+                .await?;
+
+            rooms.insert(
+                gid,
+                RoomState::new(
+                    my_uid,
+                    group_name.clone(),
+                    memories.remove(group_name).unwrap_or(Vec::new()),
+                ),
+            );
         }
+
+        Ok(Self {
+            mc_client,
+            reqw: reqwest::Client::new(),
+            config,
+            rooms,
+        })
     }
-    None
+    pub async fn add_memory(&mut self, gid: u32, memory: String) -> anyhow::Result<()> {
+        self.rooms.get_mut(&gid).unwrap().memories.push(memory);
+
+        // save
+        self.save_memories().await
+    }
+    pub async fn remove_memory(&mut self, gid: u32, idx: usize) -> anyhow::Result<String> {
+        let mem = self.rooms.get_mut(&gid).unwrap().memories.remove(idx);
+
+        // save
+        self.save_memories().await?;
+
+        Ok(mem)
+    }
+    async fn save_memories(&self) -> anyhow::Result<()> {
+        let all_memories: HashMap<String, Vec<String>> = self
+            .rooms
+            .iter()
+            .map(|(_gid, room)| (room.room_name.clone(), room.memories.clone()))
+            .collect();
+        fs::write(
+            &self.config.ollama.memory_file,
+            &serde_json::to_string_pretty(&all_memories)?,
+        )
+        .await?;
+
+        Ok(())
+    }
+    pub fn push_message(&mut self, gid: u32, msg: Message) {
+        let room = self.rooms.get_mut(&gid).unwrap();
+
+        if room.message_history.len() == self.config.ollama.prompt_messages_n {
+            room.message_history.pop_front();
+        }
+        room.message_history.push_back(msg);
+    }
 }
